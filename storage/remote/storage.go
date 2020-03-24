@@ -52,7 +52,7 @@ type Storage struct {
 	rws *WriteStorage
 
 	// For reads
-	queryables             []storage.Queryable
+	queryables             []storage.AllQueryable
 	localStartTimeCallback startTimeCallback
 }
 
@@ -80,7 +80,7 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 
 	// Update read clients
 	readHashes := make(map[string]struct{})
-	queryables := make([]storage.Queryable, 0, len(conf.RemoteReadConfigs))
+	queryables := make([]storage.AllQueryable, 0, len(conf.RemoteReadConfigs))
 	for _, rrConf := range conf.RemoteReadConfigs {
 		hash, err := toHash(rrConf)
 		if err != nil {
@@ -110,14 +110,7 @@ func (s *Storage) ApplyConfig(conf *config.Config) error {
 			return err
 		}
 
-		q := QueryableClient(c)
-		q = ExternalLabelsHandler(q, conf.GlobalConfig.ExternalLabels)
-		if len(rrConf.RequiredMatchers) > 0 {
-			q = RequiredMatchersFilter(q, labelsToEqualityMatchers(rrConf.RequiredMatchers))
-		}
-		if !rrConf.ReadRecent {
-			q = PreferLocalStorageFilter(q, s.localStartTimeCallback)
-		}
+		q := AllQueryableClient(c, conf.GlobalConfig.ExternalLabels, rrConf.RequiredMatchers, rrConf.ReadRecent, s.localStartTimeCallback)
 		queryables = append(queryables, q)
 	}
 	s.queryables = queryables
@@ -145,7 +138,25 @@ func (s *Storage) Querier(ctx context.Context, mint, maxt int64) (storage.Querie
 		}
 		queriers = append(queriers, q)
 	}
-	return storage.NewMergeQuerier(nil, queriers, storage.ChainedSeriesMerge), nil
+	return storage.NewMergeQuerier(nil, queriers, storage.ChainingSeriesMerge), nil
+}
+
+// ChunkQuerier returns a storage.MergeQuerier combining the remote client queriers
+// of each configured remote read endpoint.
+func (s *Storage) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
+	s.mtx.Lock()
+	queryables := s.queryables
+	s.mtx.Unlock()
+
+	queriers := make([]storage.ChunkQuerier, 0, len(queryables))
+	for _, queryable := range queryables {
+		q, err := queryable.ChunkQuerier(ctx, mint, maxt)
+		if err != nil {
+			return nil, err
+		}
+		queriers = append(queriers, q)
+	}
+	return storage.NewMergeChunkQuerier(nil, queriers, storage.NewCompactingChunkSeriesMerger(storage.ChainingSeriesMerge)), nil
 }
 
 // Appender implements storage.Storage.

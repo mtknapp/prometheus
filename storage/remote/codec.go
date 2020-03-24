@@ -28,6 +28,7 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 )
 
 // decodeReadLimit is the maximum size of a read request body in bytes.
@@ -144,18 +145,33 @@ func ToQueryResult(ss storage.SeriesSet, sampleLimit int) (*prompb.QueryResult, 
 	return resp, nil
 }
 
+type concreteSeries struct {
+	labels           labels.Labels
+	SampleIteratorFn func() chunkenc.Iterator
+}
+
+func (s *concreteSeries) Labels() labels.Labels       { return s.labels }
+func (s *concreteSeries) Iterator() chunkenc.Iterator { return s.SampleIteratorFn() }
+
+type samples []prompb.Sample
+
+func (s samples) Get(i int) tsdbutil.Sample { return s[i] }
+func (s samples) Len() int                  { return len(s) }
+
 // FromQueryResult unpacks and sorts a QueryResult proto.
 func FromQueryResult(sortSeries bool, res *prompb.QueryResult) storage.SeriesSet {
 	series := make([]storage.Series, 0, len(res.Timeseries))
 	for _, ts := range res.Timeseries {
-		labels := labelProtosToLabels(ts.Labels)
-		if err := validateLabelsAndMetricName(labels); err != nil {
+		lbls := labelProtosToLabels(ts.Labels)
+		if err := validateLabelsAndMetricName(lbls); err != nil {
 			return errSeriesSet{err: err}
 		}
 
 		series = append(series, &concreteSeries{
-			labels:  labels,
-			samples: ts.Samples,
+			labels: lbls,
+			SampleIteratorFn: func() chunkenc.Iterator {
+				return storage.NewListSeriesIterator(samples(ts.Samples))
+			},
 		})
 	}
 
@@ -188,19 +204,17 @@ func NegotiateResponseType(accepted []prompb.ReadRequest_ResponseType) (prompb.R
 }
 
 // StreamChunkedReadResponses iterates over series, builds chunks and streams those to the caller.
-// TODO(bwplotka): Encode only what's needed. Fetch the encoded series from blocks instead of re-encoding everything.
+// It expects Series set with populated chunks.
 func StreamChunkedReadResponses(
 	stream io.Writer,
 	queryIndex int64,
-	ss storage.SeriesSet,
+	ss storage.ChunkSeriesSet,
 	sortedExternalLabels []prompb.Label,
 	maxBytesInFrame int,
 ) error {
 	var (
-		chks     []prompb.Chunk
-		lbls     []prompb.Label
-		err      error
-		lblsSize int
+		chks []prompb.Chunk
+		lbls []prompb.Label
 	)
 
 	for ss.Next() {
@@ -208,28 +222,39 @@ func StreamChunkedReadResponses(
 		iter := series.Iterator()
 		lbls = MergeLabels(labelsToLabelsProto(series.Labels(), lbls), sortedExternalLabels)
 
-		lblsSize = 0
+		frameBytesLeft := maxBytesInFrame
 		for _, lbl := range lbls {
-			lblsSize += lbl.Size()
+			frameBytesLeft -= lbl.Size()
 		}
 
+		isNext := iter.Next()
+
 		// Send at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
-		for {
-			// TODO(bwplotka): Use ChunkIterator once available in TSDB instead of re-encoding: https://github.com/prometheus/prometheus/pull/5882
-			chks, err = encodeChunks(iter, chks, maxBytesInFrame-lblsSize)
-			if err != nil {
-				return err
+		for isNext {
+			chk := iter.At()
+
+			if chk.Chunk == nil {
+				return errors.Errorf("StreamChunkedReadResponses: found not populated chunk returned by SeriesSet at ref: %v", chk.Ref)
 			}
 
-			if len(chks) == 0 {
-				break
+			// Cut the chunk.
+			chks = append(chks, prompb.Chunk{
+				MinTimeMs: chk.MinTime,
+				MaxTimeMs: chk.MaxTime,
+				Type:      prompb.Chunk_Encoding(chk.Chunk.Encoding()),
+				Data:      chk.Chunk.Bytes(),
+			})
+			frameBytesLeft -= chks[len(chks)-1].Size()
+
+			// We are fine with minor inaccuracy of max bytes per frame. The inaccuracy will be max of full chunk size.
+			isNext = iter.Next()
+			if frameBytesLeft > 0 && isNext {
+				continue
 			}
+
 			b, err := proto.Marshal(&prompb.ChunkedReadResponse{
 				ChunkedSeries: []*prompb.ChunkedSeries{
-					{
-						Labels: lbls,
-						Chunks: chks,
-					},
+					{Labels: lbls, Chunks: chks},
 				},
 				QueryIndex: queryIndex,
 			})
@@ -243,7 +268,6 @@ func StreamChunkedReadResponses(
 
 			chks = chks[:0]
 		}
-
 		if err := iter.Err(); err != nil {
 			return err
 		}
@@ -253,66 +277,6 @@ func StreamChunkedReadResponses(
 	}
 
 	return nil
-}
-
-// encodeChunks expects iterator to be ready to use (aka iter.Next() called before invoking).
-func encodeChunks(iter chunkenc.Iterator, chks []prompb.Chunk, frameBytesLeft int) ([]prompb.Chunk, error) {
-	const maxSamplesInChunk = 120
-
-	var (
-		chkMint int64
-		chkMaxt int64
-		chk     *chunkenc.XORChunk
-		app     chunkenc.Appender
-		err     error
-	)
-
-	for iter.Next() {
-		if chk == nil {
-			chk = chunkenc.NewXORChunk()
-			app, err = chk.Appender()
-			if err != nil {
-				return nil, err
-			}
-			chkMint, _ = iter.At()
-		}
-
-		app.Append(iter.At())
-		chkMaxt, _ = iter.At()
-
-		if chk.NumSamples() < maxSamplesInChunk {
-			continue
-		}
-
-		// Cut the chunk.
-		chks = append(chks, prompb.Chunk{
-			MinTimeMs: chkMint,
-			MaxTimeMs: chkMaxt,
-			Type:      prompb.Chunk_Encoding(chk.Encoding()),
-			Data:      chk.Bytes(),
-		})
-		chk = nil
-		frameBytesLeft -= chks[len(chks)-1].Size()
-
-		// We are fine with minor inaccuracy of max bytes per frame. The inaccuracy will be max of full chunk size.
-		if frameBytesLeft <= 0 {
-			break
-		}
-	}
-	if iter.Err() != nil {
-		return nil, errors.Wrap(iter.Err(), "iter TSDB series")
-	}
-
-	if chk != nil {
-		// Cut the chunk if exists.
-		chks = append(chks, prompb.Chunk{
-			MinTimeMs: chkMint,
-			MaxTimeMs: chkMaxt,
-			Type:      prompb.Chunk_Encoding(chk.Encoding()),
-			Data:      chk.Bytes(),
-		})
-	}
-	return chks, nil
 }
 
 // MergeLabels merges two sets of sorted proto labels, preferring those in
@@ -381,58 +345,6 @@ func (c *concreteSeriesSet) At() storage.Series {
 }
 
 func (c *concreteSeriesSet) Err() error {
-	return nil
-}
-
-// concreteSeries implements storage.Series.
-type concreteSeries struct {
-	labels  labels.Labels
-	samples []prompb.Sample
-}
-
-func (c *concreteSeries) Labels() labels.Labels {
-	return labels.New(c.labels...)
-}
-
-func (c *concreteSeries) Iterator() chunkenc.Iterator {
-	return newConcreteSeriersIterator(c)
-}
-
-// concreteSeriesIterator implements storage.SeriesIterator.
-type concreteSeriesIterator struct {
-	cur    int
-	series *concreteSeries
-}
-
-func newConcreteSeriersIterator(series *concreteSeries) chunkenc.Iterator {
-	return &concreteSeriesIterator{
-		cur:    -1,
-		series: series,
-	}
-}
-
-// Seek implements storage.SeriesIterator.
-func (c *concreteSeriesIterator) Seek(t int64) bool {
-	c.cur = sort.Search(len(c.series.samples), func(n int) bool {
-		return c.series.samples[n].Timestamp >= t
-	})
-	return c.cur < len(c.series.samples)
-}
-
-// At implements storage.SeriesIterator.
-func (c *concreteSeriesIterator) At() (t int64, v float64) {
-	s := c.series.samples[c.cur]
-	return s.Timestamp, s.Value
-}
-
-// Next implements storage.SeriesIterator.
-func (c *concreteSeriesIterator) Next() bool {
-	c.cur++
-	return c.cur < len(c.series.samples)
-}
-
-// Err implements storage.SeriesIterator.
-func (c *concreteSeriesIterator) Err() error {
 	return nil
 }
 

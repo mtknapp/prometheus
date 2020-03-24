@@ -246,77 +246,78 @@ func (mockQuerier) Select(bool, *storage.SelectHints, ...*labels.Matcher) (stora
 	return mockSeriesSet{}, nil, nil
 }
 
-func TestPreferLocalStorageFilter(t *testing.T) {
-	ctx := context.Background()
-
-	tests := []struct {
-		localStartTime int64
-		mint           int64
-		maxt           int64
-		querier        storage.Querier
-	}{
-		{
-			localStartTime: int64(100),
-			mint:           int64(0),
-			maxt:           int64(50),
-			querier:        mockQuerier{ctx: ctx, mint: 0, maxt: 50},
-		},
-		{
-			localStartTime: int64(20),
-			mint:           int64(0),
-			maxt:           int64(50),
-			querier:        mockQuerier{ctx: ctx, mint: 0, maxt: 20},
-		},
-		{
-			localStartTime: int64(20),
-			mint:           int64(30),
-			maxt:           int64(50),
-			querier:        storage.NoopQuerier(),
-		},
-	}
-
-	for i, test := range tests {
-		f := PreferLocalStorageFilter(
-			storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-				return mockQuerier{ctx: ctx, mint: mint, maxt: maxt}, nil
-			}),
-			func() (int64, error) { return test.localStartTime, nil },
-		)
-
-		q, err := f.Querier(ctx, test.mint, test.maxt)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if test.querier != q {
-			t.Errorf("%d. expected querier %+v, got %+v", i, test.querier, q)
-		}
-	}
-}
-
-func TestRequiredMatchersFilter(t *testing.T) {
-	ctx := context.Background()
-
-	f := RequiredMatchersFilter(
-		storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-			return mockQuerier{ctx: ctx, mint: mint, maxt: maxt}, nil
-		}),
-		[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "special", "label")},
-	)
-
-	want := &requiredMatchersQuerier{
-		Querier:          mockQuerier{ctx: ctx, mint: 0, maxt: 50},
-		requiredMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "special", "label")},
-	}
-	have, err := f.Querier(ctx, 0, 50)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !reflect.DeepEqual(want, have) {
-		t.Errorf("expected querier %+v, got %+v", want, have)
-	}
-}
+//
+//func TestPreferLocalStorageFilter(t *testing.T) {
+//	ctx := context.Background()
+//
+//	tests := []struct {
+//		localStartTime int64
+//		mint           int64
+//		maxt           int64
+//		querier        storage.Querier
+//	}{
+//		{
+//			localStartTime: int64(100),
+//			mint:           int64(0),
+//			maxt:           int64(50),
+//			querier:        mockQuerier{ctx: ctx, mint: 0, maxt: 50},
+//		},
+//		{
+//			localStartTime: int64(20),
+//			mint:           int64(0),
+//			maxt:           int64(50),
+//			querier:        mockQuerier{ctx: ctx, mint: 0, maxt: 20},
+//		},
+//		{
+//			localStartTime: int64(20),
+//			mint:           int64(30),
+//			maxt:           int64(50),
+//			querier:        storage.NoopQuerier(),
+//		},
+//	}
+//
+//	for i, test := range tests {
+//		f := PreferLocalStorageFilter(
+//			storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+//				return mockQuerier{ctx: ctx, mint: mint, maxt: maxt}, nil
+//			}),
+//			func() (int64, error) { return test.localStartTime, nil },
+//		)
+//
+//		q, err := f.Querier(ctx, test.mint, test.maxt)
+//		if err != nil {
+//			t.Fatal(err)
+//		}
+//
+//		if test.querier != q {
+//			t.Errorf("%d. expected querier %+v, got %+v", i, test.querier, q)
+//		}
+//	}
+//}
+//
+//func TestRequiredMatchersFilter(t *testing.T) {
+//	ctx := context.Background()
+//
+//	f := RequiredMatchersFilter(
+//		storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+//			return mockQuerier{ctx: ctx, mint: mint, maxt: maxt}, nil
+//		}),
+//		[]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "special", "label")},
+//	)
+//
+//	want := &requiredMatchersQuerier{
+//		Querier:          mockQuerier{ctx: ctx, mint: 0, maxt: 50},
+//		requiredMatchers: []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "special", "label")},
+//	}
+//	have, err := f.Querier(ctx, 0, 50)
+//	if err != nil {
+//		t.Fatal(err)
+//	}
+//
+//	if !reflect.DeepEqual(want, have) {
+//		t.Errorf("expected querier %+v, got %+v", want, have)
+//	}
+//}
 
 func TestRequiredLabelsQuerierSelect(t *testing.T) {
 	tests := []struct {

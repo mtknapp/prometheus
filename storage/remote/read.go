@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 )
@@ -36,18 +37,47 @@ func init() {
 	prometheus.MustRegister(remoteReadQueries)
 }
 
-// QueryableClient returns a storage.Queryable which queries the given
-// Client to select series sets.
-func QueryableClient(c *Client) storage.Queryable {
-	remoteReadQueries.WithLabelValues(c.remoteName, c.url.String())
-	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-		return &querier{
+type allQueryableClient struct {
+	client           *Client
+	externalLabels   labels.Labels
+	requiredMatchers model.LabelSet
+	readRecent       bool
+	callback         startTimeCallback
+}
+
+func (c *allQueryableClient) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+	return &querier{
+		ctx:    ctx,
+		mint:   mint,
+		maxt:   maxt,
+		client: c.client,
+	}, nil
+}
+
+func (c *allQueryableClient) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
+	return &chunkQuerier{
+		querier: querier{
 			ctx:    ctx,
 			mint:   mint,
 			maxt:   maxt,
-			client: c,
-		}, nil
-	})
+			client: c.client,
+		},
+	}, nil
+}
+
+// AllQueryableClient returns a storage.AllQueryable which queries the given
+// Client to select series sets.
+func AllQueryableClient(c *Client, externalLabels labels.Labels, requiredMatchers model.LabelSet, readRecent bool, callback startTimeCallback) storage.AllQueryable {
+	remoteReadQueries.WithLabelValues(c.remoteName, c.url.String())
+	return &allQueryableClient{
+		client: c,
+
+		// TODO(bwplotka): Use it!
+		externalLabels:   externalLabels,
+		requiredMatchers: requiredMatchers,
+		readRecent:       readRecent,
+		callback:         callback,
+	}
 }
 
 // querier is an adapter to make a Client usable as a storage.Querier.
@@ -73,6 +103,15 @@ func (q *querier) Select(sortSeries bool, hints *storage.SelectHints, matchers .
 		return nil, nil, fmt.Errorf("remote_read: %v", err)
 	}
 
+	/*
+		externalLabelsQuerier wrap
+		if len(rrConf.RequiredMatchers) > 0 {
+					q = RequiredMatchersFilter(q, labelsToEqualityMatchers(rrConf.RequiredMatchers))
+				}
+				if !rrConf.ReadRecent {
+					q = PreferLocalStorageFilter(q, s.localStartTimeCallback)
+				}
+	*/
 	return FromQueryResult(sortSeries, res), nil, nil
 }
 
@@ -93,16 +132,20 @@ func (q *querier) Close() error {
 	return nil
 }
 
-// ExternalLabelsHandler returns a storage.Queryable which creates a
-// externalLabelsQuerier.
-func ExternalLabelsHandler(next storage.Queryable, externalLabels labels.Labels) storage.Queryable {
-	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-		q, err := next.Querier(ctx, mint, maxt)
-		if err != nil {
-			return nil, err
-		}
-		return &externalLabelsQuerier{Querier: q, externalLabels: externalLabels}, nil
-	})
+// chunkQuerier is an adapter to make a Client usable as a storage.ChunkQuerier.
+type chunkQuerier struct {
+	querier
+}
+
+// Select implements storage.ChunkQuerier and uses the given matchers to read chunk series sets from the Client.
+func (q *chunkQuerier) Select(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) (storage.ChunkSeriesSet, storage.Warnings, error) {
+	ss, w, err := q.querier.Select(sortSeries, hints, matchers...)
+	if err != nil {
+		return nil, w, err
+	}
+
+	// TODO(bwplotka) Support remote read chunked and allow returning chunks directly (TODO ticket).
+	return storage.NewSeriesSetToChunkSet(ss), w, nil
 }
 
 // externalLabelsQuerier is a querier which ensures that Select() results match
@@ -125,39 +168,39 @@ func (q externalLabelsQuerier) Select(sortSeries bool, hints *storage.SelectHint
 	return newSeriesSetFilter(s, added), warnings, nil
 }
 
-// PreferLocalStorageFilter returns a QueryableFunc which creates a NoopQuerier
-// if requested timeframe can be answered completely by the local TSDB, and
-// reduces maxt if the timeframe can be partially answered by TSDB.
-func PreferLocalStorageFilter(next storage.Queryable, cb startTimeCallback) storage.Queryable {
-	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-		localStartTime, err := cb()
-		if err != nil {
-			return nil, err
-		}
-		cmaxt := maxt
-		// Avoid queries whose timerange is later than the first timestamp in local DB.
-		if mint > localStartTime {
-			return storage.NoopQuerier(), nil
-		}
-		// Query only samples older than the first timestamp in local DB.
-		if maxt > localStartTime {
-			cmaxt = localStartTime
-		}
-		return next.Querier(ctx, mint, cmaxt)
-	})
-}
+//// PreferLocalStorageFilter returns a QueryableFunc which creates a NoopQuerier
+//// if requested timeframe can be answered completely by the local TSDB, and
+//// reduces maxt if the timeframe can be partially answered by TSDB.
+//func PreferLocalStorageFilter(next storage.Queryable, cb startTimeCallback) storage.Queryable {
+//	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+//		localStartTime, err := cb()
+//		if err != nil {
+//			return nil, err
+//		}
+//		cmaxt := maxt
+//		// Avoid queries whose timerange is later than the first timestamp in local DB.
+//		if mint > localStartTime {
+//			return storage.NoopQuerier(), nil
+//		}
+//		// Query only samples older than the first timestamp in local DB.
+//		if maxt > localStartTime {
+//			cmaxt = localStartTime
+//		}
+//		return next.Querier(ctx, mint, cmaxt)
+//	})
+//}
 
-// RequiredMatchersFilter returns a storage.Queryable which creates a
-// requiredMatchersQuerier.
-func RequiredMatchersFilter(next storage.Queryable, required []*labels.Matcher) storage.Queryable {
-	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-		q, err := next.Querier(ctx, mint, maxt)
-		if err != nil {
-			return nil, err
-		}
-		return &requiredMatchersQuerier{Querier: q, requiredMatchers: required}, nil
-	})
-}
+//// RequiredMatchersFilter returns a storage.Queryable which creates a
+//// requiredMatchersQuerier.
+//func RequiredMatchersFilter(next storage.Queryable, required []*labels.Matcher) storage.Queryable {
+//	return storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+//		q, err := next.Querier(ctx, mint, maxt)
+//		if err != nil {
+//			return nil, err
+//		}
+//		return &requiredMatchersQuerier{Querier: q, requiredMatchers: required}, nil
+//	})
+//}
 
 // requiredMatchersQuerier wraps a storage.Querier and requires Select() calls
 // to match the given labelSet.
